@@ -67,6 +67,11 @@ jobs:
           TARGET_BRANCH: ${{ steps.settings.outputs.target_branch }}
         run: |
           set -euo pipefail
+
+          protected_paths=(
+            ".github/workflows/ci.yml"
+          )
+
           git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
           git fetch --prune upstream "${UPSTREAM_BRANCH}"
           upstream_sha="$(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}")"
@@ -83,16 +88,52 @@ jobs:
             exit 0
           fi
 
-          if [ -z "${current_sha}" ]; then
-            git push origin "${upstream_sha}:refs/heads/${TARGET_BRANCH}"
+          candidate_sha="${upstream_sha}"
+
+          if [ -n "${current_sha}" ]; then
+            if git diff --quiet "${current_sha}" "${upstream_sha}" -- "${protected_paths[@]}"; then
+              echo "No protected workflow changes detected in upstream update."
+            else
+              echo "Protected workflow changes detected; preparing restoration commit."
+              git checkout --detach --force "${upstream_sha}"
+
+              for path in "${protected_paths[@]}"; do
+                if git cat-file -e "${current_sha}:${path}" 2>/dev/null; then
+                  mkdir -p "$(dirname "${path}")"
+                  git show "${current_sha}:${path}" > "${path}"
+                elif [ -e "${path}" ]; then
+                  git rm -f -- "${path}"
+                fi
+              done
+
+              if git diff --quiet "${current_sha}" --; then
+                echo "Protected workflow state already restored on ${TARGET_BRANCH}."
+                candidate_sha="${current_sha}"
+              else
+                git add -- "${protected_paths[@]}"
+                git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                  commit -m "chore(sync): preserve repository workflow configuration"
+                candidate_sha="$(git rev-parse HEAD)"
+                echo "Created restoration commit ${candidate_sha}."
+              fi
+            fi
+          fi
+
+          if [ -n "${current_sha}" ] && [ "${candidate_sha}" = "${current_sha}" ]; then
+            echo "Branch ${TARGET_BRANCH} is already synchronized with protected workflows preserved."
             exit 0
           fi
 
-          if git merge-base --is-ancestor "${current_sha}" "${upstream_sha}"; then
-            git push origin "${upstream_sha}:refs/heads/${TARGET_BRANCH}"
+          if [ -z "${current_sha}" ]; then
+            git push origin "${candidate_sha}:refs/heads/${TARGET_BRANCH}"
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor "${current_sha}" "${candidate_sha}"; then
+            git push origin "${candidate_sha}:refs/heads/${TARGET_BRANCH}"
             exit 0
           fi
 
           archive_branch="archive/${TARGET_BRANCH}/$(date -u +%Y%m%d-%H%M%S)-${current_sha:0:12}"
           git push origin "${current_sha}:refs/heads/${archive_branch}"
-          git push --force-with-lease="refs/heads/${TARGET_BRANCH}:${current_sha}" origin "${upstream_sha}:refs/heads/${TARGET_BRANCH}"
+          git push --force-with-lease="refs/heads/${TARGET_BRANCH}:${current_sha}" origin "${candidate_sha}:refs/heads/${TARGET_BRANCH}"
