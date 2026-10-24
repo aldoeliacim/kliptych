@@ -1,0 +1,16 @@
+# This standalone workflow harness follows the repository's tests/** policy.
+extend = "../../pyproject.toml"
+
+[lint.per-file-ignores]
+"test_sync.py" = [
+    "assert",
+    "magic-value-comparison",
+    "undocumented-public-method",
+    "undocumented-public-class",
+    # Fixed Git/Bash argv against temporary local fixtures, never shell=True.
+    "suspicious-subprocess-import",
+    "subprocess-without-shell-equals-true",
+    "start-process-with-partial-path",
+    # Dummy credentials passed exclusively to the fake HTTP client.
+    "hardcoded-password-func-arg",
+]
