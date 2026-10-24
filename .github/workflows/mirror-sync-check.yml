@@ -1,0 +1,44 @@
+name: Mirror Sync Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mirror-sync-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+      - name: Validate GitHub Actions workflows
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          set -euo pipefail
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          release="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          cd "${RUNNER_TEMP}"
+          curl -fsSLO "${release}/${archive}"
+          curl -fsSLO "${release}/actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          sha256sum --check --ignore-missing "actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+          tar -xzf "${archive}" actionlint
+          cd "${GITHUB_WORKSPACE}"
+          "${RUNNER_TEMP}/actionlint" -shellcheck='' .github/workflows/ci.yml .github/workflows/mirror-sync-check.yml
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Lint and format
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Type check
+        run: uv run basedpyright
+      - name: Test mirror workflow with local Git remotes
+        run: uv run --with pyyaml python .github/mirror-sync/test_sync.py
