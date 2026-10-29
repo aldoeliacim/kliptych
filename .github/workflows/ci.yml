@@ -1,174 +1,527 @@
-name: CI
+name: Mirror Sync
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  repository_dispatch:
+    types: [upstream_push]
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      upstream_repository:
+        description: "owner/repo to mirror from"
+        required: false
+      upstream_branch:
+        description: "upstream branch to mirror"
+        required: false
+      protected_paths:
+        description: "Comma/newline-separated paths preserved from current main"
+        required: false
+        default: ".github/workflows/ci.yml"
+      dry_run:
+        description: "Plan and summarize without pushing"
+        required: false
+        type: boolean
+        default: false
+      max_changed_files:
+        description: "Circuit breaker: max files changed before requiring override"
+        required: false
+        default: "400"
+      max_deletions:
+        description: "Circuit breaker: max deleted lines before requiring override"
+        required: false
+        default: "20000"
+      force_large_rewrite:
+        description: "Allow sync even if circuit breaker thresholds are exceeded"
+        required: false
+        type: boolean
+        default: false
+      require_verified_commit:
+        description: "Require GitHub commit verification on upstream tip"
+        required: false
+        type: boolean
+        default: false
+      archive_keep:
+        description: "How many archive/main refs to keep (0 disables pruning)"
+        required: false
+        default: "50"
+      notify_on_failure:
+        description: "Create/update an issue when sync fails"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
-  contents: read
+  contents: write
+  issues: write
 
-env:
-  # Todo comando uv debe fallar si el lockfile quedó desactualizado.
-  UV_LOCKED: "1"
+concurrency:
+  group: mirror-sync
+  cancel-in-progress: false
 
 jobs:
-  studio:
-    name: studio build (ubuntu-latest)
+  sync:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 26
-          cache: npm
-          cache-dependency-path: studio/package-lock.json
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Install Tauri system libraries
-        run: |
-          sudo apt-get update -o Acquire::Retries=3
-          sudo apt-get install -y -o Acquire::Retries=3 \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev
-
-      - name: Install Studio dependencies
-        working-directory: studio
-        run: npm ci
-
-      - name: Build Studio
-        working-directory: studio
-        run: npm run check
-
-  studio-windows:
-    name: studio build (windows-latest)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 26
-          cache: npm
-          cache-dependency-path: studio/package-lock.json
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Install Studio dependencies
-        working-directory: studio
-        run: npm ci
-
-      - name: Build Studio
-        working-directory: studio
-        run: npm run check
-
-  studio-macos:
-    name: studio build (macos-latest)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 26
-          cache: npm
-          cache-dependency-path: studio/package-lock.json
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Install Studio dependencies
-        working-directory: studio
-        run: npm ci
-
-      - name: Build Studio
-        working-directory: studio
-        run: npm run check
-
-  gate:
-    name: lint + type + test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: astral-sh/setup-uv@v10.2.0
-        with:
-          enable-cache: true
-
-      - name: Install ffmpeg (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -o Acquire::Retries=3 && sudo apt-get install -y -o Acquire::Retries=3 ffmpeg
-
-      - name: Install ffmpeg (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          function Test-Ffmpeg {
-            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-            return [bool](Get-Command ffmpeg -ErrorAction SilentlyContinue)
-          }
-          for ($attempt = 1; $attempt -le 3; $attempt++) {
-            choco install ffmpeg --no-progress -y
-            if (Test-Ffmpeg) { exit 0 }
-            Write-Host "choco intento $attempt no dejó ffmpeg; reintentando en 15 s"
-            Start-Sleep -Seconds 15
-          }
-          winget install --id Gyan.FFmpeg -e --disable-interactivity --accept-source-agreements --accept-package-agreements
-          if (Test-Ffmpeg) { exit 0 }
-          Write-Host "::error::ffmpeg no quedó instalado en Windows"
-          exit 1
-
-      - name: Install yt-dlp
+    timeout-minutes: 10
+    defaults:
+      run:
         shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # GITHUB_TOKEN cannot be granted Workflows write permission.
+          token: ${{ secrets.MIRROR_SYNC_TOKEN || github.token }}
+
+      - name: Resolve sync settings
+        id: settings
+        env:
+          EVENT_UPSTREAM_REPOSITORY: ${{ github.event.client_payload.upstream_repository }}
+          EVENT_UPSTREAM_BRANCH: ${{ github.event.client_payload.upstream_branch }}
+          EVENT_PROTECTED_PATHS: ${{ github.event.client_payload.protected_paths }}
+          EVENT_DRY_RUN: ${{ github.event.client_payload.dry_run }}
+          EVENT_MAX_CHANGED_FILES: ${{ github.event.client_payload.max_changed_files }}
+          EVENT_MAX_DELETIONS: ${{ github.event.client_payload.max_deletions }}
+          EVENT_FORCE_LARGE_REWRITE: ${{ github.event.client_payload.force_large_rewrite }}
+          EVENT_REQUIRE_VERIFIED_COMMIT: ${{ github.event.client_payload.require_verified_commit }}
+          EVENT_ARCHIVE_KEEP: ${{ github.event.client_payload.archive_keep }}
+          EVENT_NOTIFY_ON_FAILURE: ${{ github.event.client_payload.notify_on_failure }}
+          INPUT_UPSTREAM_REPOSITORY: ${{ github.event.inputs.upstream_repository }}
+          INPUT_UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch }}
+          INPUT_PROTECTED_PATHS: ${{ github.event.inputs.protected_paths }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_MAX_CHANGED_FILES: ${{ github.event.inputs.max_changed_files }}
+          INPUT_MAX_DELETIONS: ${{ github.event.inputs.max_deletions }}
+          INPUT_FORCE_LARGE_REWRITE: ${{ github.event.inputs.force_large_rewrite }}
+          INPUT_REQUIRE_VERIFIED_COMMIT: ${{ github.event.inputs.require_verified_commit }}
+          INPUT_ARCHIVE_KEEP: ${{ github.event.inputs.archive_keep }}
+          INPUT_NOTIFY_ON_FAILURE: ${{ github.event.inputs.notify_on_failure }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          uv tool install "yt-dlp==2026.8.19"
-          echo "$(uv tool dir --bin)" >> "$GITHUB_PATH"
+          set -euo pipefail
 
-      - name: Sync dependencies
-        run: uv sync --locked
+          normalize_bool() {
+            case "${1,,}" in
+              "1"|"true"|"yes"|"y"|"on") echo "true" ;;
+              "0"|"false"|"no"|"n"|"off") echo "false" ;;
+              *) echo "::error::Invalid boolean value." >&2; return 1 ;;
+            esac
+          }
 
-      - name: Format check
-        run: uv run ruff format --check .
+          normalize_nonempty() {
+            if [ -n "${1}" ]; then
+              echo "${1}"
+            else
+              echo "${2}"
+            fi
+          }
 
-      - name: Lint
-        run: uv run ruff check .
+          upstream_repository="${EVENT_UPSTREAM_REPOSITORY:-${INPUT_UPSTREAM_REPOSITORY:-}}"
+          upstream_branch="${EVENT_UPSTREAM_BRANCH:-${INPUT_UPSTREAM_BRANCH:-${DEFAULT_BRANCH}}}"
+          protected_paths_raw="$(normalize_nonempty "${EVENT_PROTECTED_PATHS:-}" "${INPUT_PROTECTED_PATHS:-.github/workflows/ci.yml}")"
+          dry_run_raw="$(normalize_nonempty "${EVENT_DRY_RUN:-}" "${INPUT_DRY_RUN:-false}")"
+          max_changed_files_raw="$(normalize_nonempty "${EVENT_MAX_CHANGED_FILES:-}" "${INPUT_MAX_CHANGED_FILES:-400}")"
+          max_deletions_raw="$(normalize_nonempty "${EVENT_MAX_DELETIONS:-}" "${INPUT_MAX_DELETIONS:-20000}")"
+          force_large_rewrite_raw="$(normalize_nonempty "${EVENT_FORCE_LARGE_REWRITE:-}" "${INPUT_FORCE_LARGE_REWRITE:-false}")"
+          require_verified_commit_raw="$(normalize_nonempty "${EVENT_REQUIRE_VERIFIED_COMMIT:-}" "${INPUT_REQUIRE_VERIFIED_COMMIT:-false}")"
+          archive_keep_raw="$(normalize_nonempty "${EVENT_ARCHIVE_KEEP:-}" "${INPUT_ARCHIVE_KEEP:-50}")"
+          notify_on_failure_raw="$(normalize_nonempty "${EVENT_NOTIFY_ON_FAILURE:-}" "${INPUT_NOTIFY_ON_FAILURE:-true}")"
+          target_branch="main"
 
-      - name: Type check
-        run: uv run basedpyright
+          if [ -z "${upstream_repository}" ]; then
+            repo_api_response="$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}")"
+            upstream_repository="$(python -c 'import json,sys; d=json.loads(sys.stdin.read()); print((d.get("source") or {}).get("full_name") or (d.get("parent") or {}).get("full_name") or "")' <<< "${repo_api_response}")"
+          fi
 
-      - name: Tests
-        run: uv run pytest
-
-      - name: Integration tests must not skip
-        shell: bash
-        run: |
-          set -o pipefail
-          # faster-whisper (extra transcription) y mediapipe (extra reframe) no
-          # se instalan en CI; excluir sus integraciones del gate.
-          uv run pytest -m integration -q --no-cov \
-            --ignore=tests/test_transcribe_integration.py \
-            --ignore=tests/test_reframe_integration.py \
-            --ignore=tests/test_download_integration.py | tee integration.log
-          if grep -q "skipped" integration.log; then
-            echo "::error::Los tests de integración se saltaron en CI"
+          if [ -z "${upstream_repository}" ]; then
+            echo "::error::Unable to resolve upstream repository. Provide repository_dispatch client_payload.upstream_repository or workflow_dispatch input upstream_repository."
             exit 1
+          fi
+
+          if ! [[ "${upstream_repository}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
+             [ "${upstream_repository,,}" = "${GITHUB_REPOSITORY,,}" ]; then
+            echo "::error::upstream_repository must be another owner/repo." >&2
+            exit 1
+          fi
+          git check-ref-format "refs/heads/${upstream_branch}"
+
+          if ! [[ "${max_changed_files_raw}" =~ ^[0-9]+$ ]]; then
+            echo "::error::max_changed_files must be a non-negative integer."
+            exit 1
+          fi
+
+          if ! [[ "${max_deletions_raw}" =~ ^[0-9]+$ ]]; then
+            echo "::error::max_deletions must be a non-negative integer."
+            exit 1
+          fi
+
+          if ! [[ "${archive_keep_raw}" =~ ^[0-9]+$ ]]; then
+            echo "::error::archive_keep must be a non-negative integer."
+            exit 1
+          fi
+
+          limits="$(python - "${max_changed_files_raw}" "${max_deletions_raw}" "${archive_keep_raw}" <<'PY'
+          import sys
+          values = [int(value) for value in sys.argv[1:]]
+          if any(value > 2147483647 for value in values):
+              raise SystemExit("Sync limits must not exceed 2147483647")
+          print(*values)
+          PY
+          )"
+          read -r max_changed_files_raw max_deletions_raw archive_keep_raw <<< "${limits}"
+          dry_run="$(normalize_bool "${dry_run_raw}")"
+          force_large_rewrite="$(normalize_bool "${force_large_rewrite_raw}")"
+          require_verified_commit="$(normalize_bool "${require_verified_commit_raw}")"
+          notify_on_failure="$(normalize_bool "${notify_on_failure_raw}")"
+
+          protected_paths_csv="$(PROTECTED_PATHS_RAW="${protected_paths_raw}" python - <<'PY'
+          import os
+          from pathlib import PurePosixPath
+          raw = os.environ.get("PROTECTED_PATHS_RAW", "")
+          parts = []
+          for token in raw.replace("\n", ",").split(","):
+              value = token.strip()
+              if value:
+                  path = PurePosixPath(value)
+                  if (path.is_absolute() or value.startswith("-") or
+                      any(part in {"..", ".git"} for part in path.parts) or
+                      any(character in value for character in "*?[]:\r") or
+                      str(path) != value or value == "."):
+                      raise SystemExit("Protected paths must be literal repository-relative paths")
+                  parts.append(value)
+          if not parts:
+              parts = [".github/workflows/ci.yml"]
+          # Custom paths cannot remove the mirror controller or its checks.
+          parts.extend([".github/workflows/ci.yml",
+                        ".github/workflows/mirror-sync-check.yml", ".github/mirror-sync"])
+          seen = set()
+          ordered = []
+          for value in parts:
+              if value not in seen:
+                  seen.add(value)
+                  ordered.append(value)
+          print(",".join(ordered))
+          PY
+          )"
+
+          {
+            echo "upstream_repository=${upstream_repository}"
+            echo "upstream_branch=${upstream_branch}"
+            echo "protected_paths_csv=${protected_paths_csv}"
+            echo "dry_run=${dry_run}"
+            echo "max_changed_files=${max_changed_files_raw}"
+            echo "max_deletions=${max_deletions_raw}"
+            echo "force_large_rewrite=${force_large_rewrite}"
+            echo "require_verified_commit=${require_verified_commit}"
+            echo "archive_keep=${archive_keep_raw}"
+            echo "notify_on_failure=${notify_on_failure}"
+            echo "target_branch=${target_branch}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Mirror upstream commit
+        env:
+          UPSTREAM_REPOSITORY: ${{ steps.settings.outputs.upstream_repository }}
+          UPSTREAM_BRANCH: ${{ steps.settings.outputs.upstream_branch }}
+          PROTECTED_PATHS_CSV: ${{ steps.settings.outputs.protected_paths_csv }}
+          DRY_RUN: ${{ steps.settings.outputs.dry_run }}
+          MAX_CHANGED_FILES: ${{ steps.settings.outputs.max_changed_files }}
+          MAX_DELETIONS: ${{ steps.settings.outputs.max_deletions }}
+          FORCE_LARGE_REWRITE: ${{ steps.settings.outputs.force_large_rewrite }}
+          REQUIRE_VERIFIED_COMMIT: ${{ steps.settings.outputs.require_verified_commit }}
+          ARCHIVE_KEEP: ${{ steps.settings.outputs.archive_keep }}
+          TARGET_BRANCH: ${{ steps.settings.outputs.target_branch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MIRROR_SYNC_TOKEN: ${{ secrets.MIRROR_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          IFS=',' read -r -a protected_paths <<< "${PROTECTED_PATHS_CSV}"
+          if [ "${#protected_paths[@]}" -eq 0 ]; then
+            protected_paths=(".github/workflows/ci.yml")
+          fi
+
+          write_summary() {
+            {
+              echo "## Mirror Sync Result"
+              echo
+              echo "| Field | Value |"
+              echo "| --- | --- |"
+              echo "| action | ${sync_action} |"
+              echo "| upstream_repository | ${UPSTREAM_REPOSITORY} |"
+              echo "| upstream_branch | ${UPSTREAM_BRANCH} |"
+              echo "| target_branch | ${TARGET_BRANCH} |"
+              echo "| upstream_sha | ${upstream_sha} |"
+              echo "| current_sha | ${current_sha:-<none>} |"
+              echo "| candidate_sha | ${candidate_sha} |"
+              echo "| protected_paths | ${PROTECTED_PATHS_CSV} |"
+              echo "| protected_paths_changed | ${protected_paths_changed} |"
+              echo "| restoration_commit_created | ${restoration_commit_created} |"
+              echo "| changed_files | ${changed_files_count} |"
+              echo "| deleted_lines | ${deleted_lines_count} |"
+              echo "| max_changed_files | ${MAX_CHANGED_FILES} |"
+              echo "| max_deletions | ${MAX_DELETIONS} |"
+              echo "| force_large_rewrite | ${FORCE_LARGE_REWRITE} |"
+              echo "| require_verified_commit | ${REQUIRE_VERIFIED_COMMIT} |"
+              echo "| dry_run | ${DRY_RUN} |"
+              echo "| archive_keep | ${ARCHIVE_KEEP} |"
+              echo "| archive_refs_pruned | ${archive_refs_pruned} |"
+              echo "| notes | ${sync_note} |"
+            } >> "${GITHUB_STEP_SUMMARY}"
+          }
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --prune upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          upstream_sha="$(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}")"
+          upstream_subject="$(git log -1 --format=%s "${upstream_sha}")"
+
+          sync_action="unknown"
+          sync_note="-"
+          protected_paths_changed="false"
+          restoration_commit_created="false"
+          changed_files_count="0"
+          deleted_lines_count="0"
+          archive_refs_pruned="0"
+          candidate_sha="${upstream_sha}"
+
+          if [ "${UPSTREAM_REPOSITORY}" = "${GITHUB_REPOSITORY}" ] && [[ "${upstream_subject}" == "chore(sync): preserve repository workflow configuration"* ]]; then
+            sync_action="loop_guard_skip"
+            sync_note="Upstream points to a sync restoration commit in this same repository."
+            current_sha=""
+            write_summary
+            exit 0
+          fi
+
+          if [ "${REQUIRE_VERIFIED_COMMIT}" = "true" ]; then
+            commit_api_response="$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/commits/${upstream_sha}")"
+            if ! COMMIT_API_RESPONSE="${commit_api_response}" python - <<'PY'
+          import json
+          import os
+          data = json.loads(os.environ["COMMIT_API_RESPONSE"])
+          raise SystemExit(0 if ((data.get("commit") or {}).get("verification") or {}).get("verified") else 1)
+          PY
+            then
+              sync_action="provenance_blocked"
+              sync_note="Upstream tip commit is not GitHub-verified."
+              current_sha=""
+              write_summary
+              echo "::error::Upstream commit ${upstream_sha} failed provenance verification."
+              exit 1
+            fi
+          fi
+
+          remote_status=0
+          git ls-remote --exit-code --heads origin "${TARGET_BRANCH}" >/dev/null || remote_status=$?
+          if [ "${remote_status}" -eq 0 ]; then
+            git fetch --prune origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+            current_sha="$(git rev-parse "refs/remotes/origin/${TARGET_BRANCH}")"
+          elif [ "${remote_status}" -eq 2 ]; then
+            current_sha=""
+          else
+            echo "::error::Unable to read target branch; refusing initial push."
+            exit "${remote_status}"
+          fi
+
+          if [ -n "${current_sha}" ] && [ "${current_sha}" = "${upstream_sha}" ]; then
+            sync_action="already_synchronized"
+            sync_note="Current branch tip already matches upstream."
+            write_summary
+            exit 0
+          fi
+
+          if [ -n "${current_sha}" ]; then
+            if git diff --quiet "${current_sha}" "${upstream_sha}" -- "${protected_paths[@]}"; then
+              echo "No protected workflow changes detected in upstream update."
+            else
+              protected_paths_changed="true"
+              echo "Protected workflow changes detected; preparing restoration commit."
+              git checkout --detach --force "${upstream_sha}"
+
+              for path in "${protected_paths[@]}"; do
+                git rm -rf --ignore-unmatch -- "${path}"
+                if git cat-file -e "${current_sha}:${path}" 2>/dev/null; then
+                  git restore --source="${current_sha}" --staged --worktree -- "${path}"
+                fi
+              done
+
+              if ! git diff --cached --quiet; then
+                git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                  commit -m "chore(sync): preserve repository workflow configuration"
+                candidate_sha="$(git rev-parse HEAD)"
+                restoration_commit_created="true"
+                echo "Created restoration commit ${candidate_sha}."
+              else
+                echo "Protected paths already match desired preserved content."
+              fi
+            fi
+          fi
+
+          if [ -n "${current_sha}" ] && git diff --quiet "${current_sha}" "${candidate_sha}"; then
+            sync_action="already_synchronized_preserved"
+            sync_note="No material difference after protected-path restoration."
+            write_summary
+            exit 0
+          fi
+
+          if [ -n "${current_sha}" ]; then
+            changed_files_count="$(git diff --name-only "${current_sha}" "${candidate_sha}" | sed '/^$/d' | wc -l | tr -d ' ')"
+            deleted_lines_count="$(git diff --numstat "${current_sha}" "${candidate_sha}" | awk '{
+              value=$2
+              if (value ~ /^[0-9]+$/) total+=value
+            } END {print total+0}')"
+            if { [ "${changed_files_count}" -gt "${MAX_CHANGED_FILES}" ] || [ "${deleted_lines_count}" -gt "${MAX_DELETIONS}" ]; } && [ "${FORCE_LARGE_REWRITE}" != "true" ]; then
+              sync_action="circuit_breaker_blocked"
+              sync_note="Change volume exceeded thresholds; rerun with force_large_rewrite=true to override."
+              write_summary
+              echo "::error::Circuit breaker blocked sync (files=${changed_files_count}, deletions=${deleted_lines_count})."
+              exit 1
+            fi
+          fi
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            if [ -z "${current_sha}" ]; then
+              sync_action="dry_run_initial_push"
+              sync_note="Would create target branch from candidate SHA."
+            elif git merge-base --is-ancestor "${current_sha}" "${candidate_sha}"; then
+              sync_action="dry_run_fast_forward"
+              sync_note="Would fast-forward target branch to candidate SHA."
+            else
+              sync_action="dry_run_archive_and_force"
+              sync_note="Would archive current target branch then force-with-lease to candidate SHA."
+            fi
+            write_summary
+            exit 0
+          fi
+
+          if [ -z "${MIRROR_SYNC_TOKEN}" ]; then
+            echo "::error::Set MIRROR_SYNC_TOKEN with Contents and Workflows write access before syncing. GITHUB_TOKEN cannot push workflow changes."
+            exit 1
+          fi
+
+          if [ -z "${current_sha}" ]; then
+            git push origin "${candidate_sha}:refs/heads/${TARGET_BRANCH}"
+            sync_action="initial_push"
+            sync_note="Target branch did not exist and was created."
+            write_summary
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor "${current_sha}" "${candidate_sha}"; then
+            git push origin "${candidate_sha}:refs/heads/${TARGET_BRANCH}"
+            sync_action="fast_forward"
+            sync_note="Target branch was fast-forwarded."
+          else
+            archive_branch="archive/${TARGET_BRANCH}/$(date -u +%Y%m%d-%H%M%S)-${current_sha:0:12}"
+            git push --atomic --force-with-lease="refs/heads/${TARGET_BRANCH}:${current_sha}" origin \
+              "${current_sha}:refs/heads/${archive_branch}" "${candidate_sha}:refs/heads/${TARGET_BRANCH}"
+            sync_action="archive_and_force"
+            sync_note="Target branch history rewritten; previous tip archived."
+          fi
+
+          if [ "${ARCHIVE_KEEP}" -gt 0 ]; then
+            mapfile -t archive_refs < <(git ls-remote --heads origin "archive/${TARGET_BRANCH}/*" | awk '{print $2}' | sort -r)
+            if [ "${#archive_refs[@]}" -gt "${ARCHIVE_KEEP}" ]; then
+              index=0
+              for ref in "${archive_refs[@]}"; do
+                index=$((index + 1))
+                if [ "${index}" -le "${ARCHIVE_KEEP}" ]; then
+                  continue
+                fi
+                git push origin ":${ref}"
+                archive_refs_pruned=$((archive_refs_pruned + 1))
+              done
+            fi
+          fi
+
+          write_summary
+
+      - name: Notify sync failure
+        if: failure()
+        env:
+          NOTIFY_ON_FAILURE: ${{ steps.settings.outputs.notify_on_failure }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+          JOB: ${{ github.job }}
+        run: |
+          set -euo pipefail
+
+          if [ "${NOTIFY_ON_FAILURE}" != "true" ]; then
+            echo "Failure notification disabled."
+            exit 0
+          fi
+
+          owner="${REPOSITORY%/*}"
+          repo="${REPOSITORY#*/}"
+          issue_title="[Mirror Sync] Failure alert"
+          run_url="https://github.com/${REPOSITORY}/actions/runs/${RUN_ID}"
+          issue_body="$(cat <<EOF
+          Mirror Sync failed.
+
+          - Workflow: ${WORKFLOW}
+          - Job: ${JOB}
+          - Run: ${run_url}
+
+          This issue is managed automatically by the sync workflow.
+          EOF
+          )"
+          export ISSUE_TITLE="${issue_title}" ISSUE_BODY="${issue_body}" RUN_URL="${run_url}"
+
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${owner}/${repo}/labels" \
+            -d '{"name":"mirror-sync-failure","color":"B60205","description":"Automated mirror sync failures"}' >/dev/null || true
+
+          existing_issues="$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${owner}/${repo}/issues?state=open&labels=mirror-sync-failure&per_page=100")"
+
+          issue_number="$(ISSUES_JSON="${existing_issues}" ISSUE_TITLE="${issue_title}" python - <<'PY'
+          import json
+          import os
+
+          issues = json.loads(os.environ["ISSUES_JSON"])
+          title = os.environ["ISSUE_TITLE"]
+          for issue in issues:
+              if "pull_request" in issue:
+                  continue
+              if issue.get("title") == title:
+                  print(issue["number"])
+                  break
+          PY
+          )"
+
+          if [ -n "${issue_number}" ]; then
+            curl -fsSL -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              "https://api.github.com/repos/${owner}/${repo}/issues/${issue_number}/comments" \
+              -d "$(python - <<'PY'
+          import json
+          import os
+          run_url = os.environ["RUN_URL"]
+          print(json.dumps({"body": f"Another failure occurred: {run_url}"}))
+          PY
+          )" >/dev/null
+          else
+            curl -fsSL -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              "https://api.github.com/repos/${owner}/${repo}/issues" \
+              -d "$(python - <<'PY'
+          import json
+          import os
+          title = os.environ["ISSUE_TITLE"]
+          body = os.environ["ISSUE_BODY"]
+          print(json.dumps({"title": title, "body": body, "labels": ["mirror-sync-failure"]}))
+          PY
+          )" >/dev/null
           fi
